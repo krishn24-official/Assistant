@@ -61,3 +61,10 @@ def send_email(to: str, subject: str, body: str):
     create_message = {"raw": encoded}
     
     service.users().messages().send(userId="me", body=create_message).execute()
+
+def mark_as_read(message_id: str):
+    service = get_gmail_service()
+    service.users().messages().modify(
+        userId="me", id=message_id,
+        body={"removeLabelIds": ["UNREAD"]}
+    ).execute()

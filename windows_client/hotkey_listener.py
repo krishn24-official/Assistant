@@ -408,7 +408,40 @@ def handle_command():
     threading.Thread(target=_run_and_release, daemon=True).start()
 
 
+_seen_message_ids = set()
+
+def _mail_poll_loop():
+    global _seen_message_ids
+    import time as _time
+    first_run = True
+    while True:
+        _time.sleep(60)
+        try:
+            resp = requests.get(f"{BRAIN_URL}/gmail/unread", timeout=20)
+            resp.raise_for_status()
+            emails = resp.json().get("emails", [])
+        except Exception:
+            continue  # network hiccup, just try again next cycle
+
+        current_ids = {e["id"] for e in emails}
+        if first_run:
+            _seen_message_ids = current_ids
+            first_run = False
+            continue
+
+        new_ones = [e for e in emails if e["id"] not in _seen_message_ids]
+        _seen_message_ids = current_ids
+
+        if new_ones and not tts.is_speaking() and not _busy_lock.locked():
+            for e in new_ones[:3]:
+                sender = e["from"].split("<")[0].strip()
+                msg = f"New email from {sender}: {e['subject']}."
+                print(f"[auto-announce] {msg}")
+                tts.speak(msg)
+
+
 def main():
+    threading.Thread(target=_mail_poll_loop, daemon=True).start()
     print(f"Ready. Hold {HOTKEY} and speak a command. Ctrl+C to quit.")
     keyboard.add_hotkey(HOTKEY, handle_command, suppress=False, trigger_on_release=False)
     keyboard.wait()

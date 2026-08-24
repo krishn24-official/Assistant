@@ -51,6 +51,10 @@ class ReviseEmailRequest(BaseModel):
     instruction: str
 
 
+class MarkReadRequest(BaseModel):
+    message_id: str
+
+
 @app.post("/intent")
 def get_intent(req: IntentRequest):
     """Turn a transcribed command into a structured action."""
@@ -132,6 +136,15 @@ def get_unread_emails():
 def send_email(req: SendEmailRequest):
     try:
         gmail_client.send_email(req.to, req.subject, req.body)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/gmail/mark-read")
+def mark_read(req: MarkReadRequest):
+    try:
+        gmail_client.mark_as_read(req.message_id)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

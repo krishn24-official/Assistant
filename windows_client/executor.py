@@ -400,6 +400,12 @@ def _announce_email(index: int) -> dict:
     sender_name = email["from"].split("<")[0].strip()
     position = f"({index+1} of {len(_last_unread_emails)}) " if len(_last_unread_emails) > 1 else ""
     msg = f"{position}From {sender_name}: {email['subject']}. {email['snippet'][:100]} Want to reply, or say next?"
+    
+    try:
+        requests.post(f"{BRAIN_URL}/gmail/mark-read", json={"message_id": email["id"]}, timeout=10)
+    except Exception:
+        pass
+        
     return {
         "needs_confirmation": True,
         "kind": "mail_walkthrough",
