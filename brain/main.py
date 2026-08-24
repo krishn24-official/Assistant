@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import memory
+import gmail_client
 from config import settings
 from llm_providers import ProviderError, generate_text, parse_intent
 
@@ -30,6 +31,24 @@ class DraftMessageRequest(BaseModel):
 
 class AnswerRequest(BaseModel):
     question: str
+
+
+class SendEmailRequest(BaseModel):
+    to: str
+    subject: str
+    body: str
+
+class GenerateReplyRequest(BaseModel):
+    original_subject: str
+    original_snippet: str
+    instruction: str
+
+
+class ReviseEmailRequest(BaseModel):
+    to: str
+    subject: str
+    body: str
+    instruction: str
 
 
 @app.post("/intent")
@@ -98,3 +117,73 @@ def answer_question(req: AnswerRequest):
 @app.get("/health")
 def health():
     return {"status": "ok", "provider_order": settings.provider_order}
+
+
+@app.get("/gmail/unread")
+def get_unread_emails():
+    try:
+        emails = gmail_client.list_unread()
+        return {"emails": emails}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/gmail/send")
+def send_email(req: SendEmailRequest):
+    try:
+        gmail_client.send_email(req.to, req.subject, req.body)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate-reply")
+def generate_reply(req: GenerateReplyRequest):
+    system_prompt = (
+        "You are writing a short, natural email reply. Given the original email's subject "
+        "and a snippet of its content, and the user's instruction for what to say, write "
+        "ONLY the reply body - concise, 2-4 sentences unless the instruction implies more. "
+        "If the instruction is something like 'write something for me' or empty, write a brief, "
+        "polite, appropriate reply based on the snippet alone."
+    )
+    prompt = f"Subject: {req.original_subject}\nSnippet: {req.original_snippet}\nInstruction: {req.instruction}"
+    try:
+        from llm_providers import generate_text, ProviderError
+        draft = generate_text(system_prompt, prompt).strip()
+        return {"body": draft}
+    except ProviderError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/revise-email")
+def revise_email(req: ReviseEmailRequest):
+    system_prompt = (
+        "You are revising a draft email based on the user's instruction. Return ONLY "
+        "the revised email in this exact format:\n"
+        "TO: <email address>\n"
+        "SUBJECT: <subject>\n"
+        "BODY: <body>\n"
+        "Keep it concise. If the instruction only concerns one field, keep the "
+        "other fields UNCHANGED exactly as given - do not invent a new recipient, "
+        "subject, or body unless the instruction asks for that specific field."
+    )
+    prompt = f"Original To: {req.to}\nOriginal Subject: {req.subject}\nOriginal Body: {req.body}\nInstruction: {req.instruction}"
+    try:
+        revised_text = generate_text(system_prompt, prompt).strip()
+        import re
+        match = re.search(
+            r"TO:\s*(.*?)\nSUBJECT:\s*(.*?)\nBODY:\s*(.*)",
+            revised_text,
+            re.DOTALL
+        )
+        if match:
+            to_address = match.group(1).strip() or req.to
+            subject = match.group(2).strip() or req.subject
+            body = match.group(3).strip() or req.body
+        else:
+            to_address, subject, body = req.to, req.subject, req.body
+            
+        return {"to": to_address, "subject": subject, "body": body}
+    except ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))

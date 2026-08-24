@@ -192,6 +192,34 @@ TOOLS_OPENAI_FORMAT: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_mail",
+            "description": "Check for new/unread emails and summarize them for the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Compose and send an email. Only use this when the user has given clear content for the email - if unclear, ask what they want to say instead of guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
 ]
 
 

@@ -8,6 +8,7 @@ import os
 import subprocess
 import webbrowser
 import difflib
+import re
 
 from pathlib import Path
 from dotenv import load_dotenv
@@ -16,6 +17,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 import requests
 
 BRAIN_URL = os.getenv("BRAIN_URL", "http://localhost:8008")
+
+_last_unread_emails = []
 
 # Add to this as you go - common app name -> how to launch it on Windows.
 APP_LAUNCHERS = {
@@ -97,6 +100,7 @@ def open_app(app_name: str):
             matched_name = ALIASES[matched_name]
         return {
             "needs_confirmation": True,
+            "kind": "app_suggestion",
             "suggested": matched_name,
             "original_action": "open_app",
             "original_params": {"app_name": matched_name}
@@ -302,6 +306,145 @@ def play_video(query: str) -> str:
     return f"Playing {items[0]['snippet']['title']}."
 
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+def looks_like_valid_email(addr: str) -> bool:
+    return bool(EMAIL_RE.match(addr.strip()))
+
+
+def check_mail() -> dict | str:
+    global _last_unread_emails
+    try:
+        resp = requests.get(f"{BRAIN_URL}/gmail/unread", timeout=20)
+        resp.raise_for_status()
+        emails = resp.json().get("emails", [])
+        _last_unread_emails = emails
+        
+        if not emails:
+            return "No new emails."
+        
+        return {
+            "needs_mail_walkthrough": True,
+            "index": 0,
+            "total": len(emails)
+        }
+    except Exception as e:
+        return f"Failed to check mail: {e}"
+
+
+def send_email_action(to: str, subject: str, body: str) -> dict:
+    if not looks_like_valid_email(to):
+        return {
+            "needs_clarification": True,
+            "action": "email_address_retry",
+            "message": f"That address doesn't look right: {to}. Can you say the email address again, clearly?",
+            "pending": {"subject": subject, "body": body}
+        }
+    return {
+        "needs_confirmation": True,
+        "kind": "send_email",
+        "message": f"Ready to send to {to}, subject: {subject}. Say yes to send or no to cancel.",
+        "to": to,
+        "subject": subject,
+        "body": body
+    }
+
+
+def _send_email_confirmed(to: str, subject: str, body: str) -> str:
+    try:
+        resp = requests.post(f"{BRAIN_URL}/gmail/send", json={"to": to, "subject": subject, "body": body}, timeout=20)
+        resp.raise_for_status()
+        return f"Email sent to {to}."
+    except Exception as e:
+        return f"Failed to send email: {e}"
+
+
+def revise_email(to: str, subject: str, body: str, instruction: str, walkthrough_index: int = None) -> dict:
+    import json
+    try:
+        resp = requests.post(
+            f"{BRAIN_URL}/revise-email",
+            json={"to": to, "subject": subject, "body": body, "instruction": instruction},
+            timeout=20
+        )
+        resp.raise_for_status()
+        
+        data = resp.json()
+        new_to = data.get("to", to)
+        new_subject = data.get("subject", subject)
+        new_body = data.get("body", body)
+        
+        if not looks_like_valid_email(new_to):
+            return {
+                "needs_clarification": True,
+                "action": "email_address_retry",
+                "message": f"That address doesn't look right: {new_to}. Can you say the email address again, clearly?",
+                "pending": {"subject": new_subject, "body": new_body, "walkthrough_index": walkthrough_index}
+            }
+
+        result = {
+            "needs_confirmation": True,
+            "kind": "send_email",
+            "message": f"Revised. Sending to {new_to}, subject: {new_subject}. Body: {new_body}. Say yes to send or no to cancel.",
+            "to": new_to,
+            "subject": new_subject,
+            "body": new_body
+        }
+        if walkthrough_index is not None:
+            result["walkthrough_index"] = walkthrough_index
+        return result
+    except Exception as e:
+        return f"Couldn't revise draft: {e}"
+
+def _announce_email(index: int) -> dict:
+    email = _last_unread_emails[index]
+    sender_name = email["from"].split("<")[0].strip()
+    position = f"({index+1} of {len(_last_unread_emails)}) " if len(_last_unread_emails) > 1 else ""
+    msg = f"{position}From {sender_name}: {email['subject']}. {email['snippet'][:100]} Want to reply, or say next?"
+    return {
+        "needs_confirmation": True,
+        "kind": "mail_walkthrough",
+        "message": msg,
+        "index": index
+    }
+
+def _reply_to_current(index: int, instruction: str) -> dict:
+    email = _last_unread_emails[index]
+    sender_name = email["from"].split("<")[0].strip()
+    
+    addr_match = re.search(r"<(.+?)>", email["from"])
+    to_addr = addr_match.group(1) if addr_match else email["from"]
+    
+    try:
+        resp = requests.post(f"{BRAIN_URL}/generate-reply", json={
+            "original_subject": email["subject"],
+            "original_snippet": email["snippet"],
+            "instruction": instruction or "write something appropriate"
+        }, timeout=20)
+        resp.raise_for_status()
+        body = resp.json()["body"]
+    except Exception as e:
+        return f"Failed to generate reply: {e}"
+        
+    subject = f"Re: {email['subject']}"
+    if subject.lower().startswith("re: re:"):
+        subject = subject[4:]
+    
+    return {
+        "needs_confirmation": True,
+        "kind": "send_email",
+        "message": f"Replying to {sender_name}: {body}. Say yes to send or tell me what to change.",
+        "to": to_addr,
+        "subject": subject,
+        "body": body,
+        "walkthrough_index": index
+    }
+
+MAIL_WALKTHROUGH = {
+    "announce": _announce_email,
+    "reply": _reply_to_current
+}
+
+
 DISPATCH = {
     "open_app": lambda p: open_app(**p),
     "web_search": lambda p: web_search(**p),
@@ -314,11 +457,32 @@ DISPATCH = {
     "open_folder": lambda p: open_folder(**p),
     "search_files": lambda p: search_files(**p),
     "open_website": lambda p: open_website(**p),
+    "check_mail": lambda p: check_mail(),
+    "send_email": lambda p: send_email_action(**p),
     "no_action": lambda p: f"Didn't catch a clear command ({p.get('reason', 'unclear')}).",
 }
 
+def _retry_email_address(text: str, pending: dict) -> dict:
+    cleaned = text.lower().replace(" at ", "@").replace(" dot ", ".").replace(" ", "")
+    if not looks_like_valid_email(cleaned):
+        return {
+            "needs_clarification": True,
+            "action": "email_address_retry",
+            "message": f"That address doesn't look right: {cleaned}. Can you say the email address again, clearly?",
+            "pending": pending
+        }
+    return {
+        "needs_confirmation": True,
+        "kind": "send_email",
+        "message": f"Ready to send to {cleaned}, subject: {pending['subject']}. Say yes to send or no to cancel.",
+        "to": cleaned,
+        "subject": pending['subject'],
+        "body": pending['body']
+    }
+
 RESOLVE_CLARIFICATION = {
-    "draft_message": lambda contact, text: _draft_message_core(contact, text)
+    "draft_message": lambda contact, text: _draft_message_core(contact, text),
+    "email_address_retry": _retry_email_address
 }
 
 

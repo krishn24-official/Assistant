@@ -26,6 +26,7 @@ from faster_whisper import WhisperModel
 
 from executor import execute, RESOLVE_CLARIFICATION
 from tts import speak
+import tts
 
 BRAIN_URL = os.getenv("BRAIN_URL", "http://localhost:8008")
 HOTKEY = os.getenv("ASSISTANT_HOTKEY", "ctrl+alt+space")
@@ -117,7 +118,8 @@ def _handle_result(result):
         _pending_clarification = {
             "timestamp": time.time(),
             "action": result["action"],
-            "contact": result["contact"]
+            "contact": result.get("contact"),
+            "pending": result.get("pending")
         }
         msg = result["message"]
         print(msg)
@@ -126,12 +128,14 @@ def _handle_result(result):
         speak(msg)
         print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
     elif isinstance(result, dict) and result.get("needs_confirmation"):
-        _pending_confirmation = {
-            "timestamp": time.time(),
-            "original_action": result["original_action"],
-            "original_params": result["original_params"]
-        }
-        msg = f"Did you mean {result['suggested']}? Hold the hotkey and say yes or no."
+        _pending_confirmation = result
+        print(f"[debug] _pending_confirmation SET to {result.get('kind')} in _handle_result")
+        _pending_confirmation["timestamp"] = time.time()
+        
+        if result.get("kind") == "app_suggestion":
+            msg = f"Did you mean {result['suggested']}? Hold the hotkey and say yes or no."
+        else:
+            msg = result.get("message", "Say yes to confirm or no to cancel.")
         print(msg)
         
         t0_speak = time.time()
@@ -144,6 +148,11 @@ def _handle_result(result):
         t0_speak = time.time()
         speak(msg)
         print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
+    elif isinstance(result, dict) and result.get("needs_mail_walkthrough"):
+        from executor import MAIL_WALKTHROUGH
+        res = MAIL_WALKTHROUGH["announce"](result["index"])
+        _handle_result(res)
+        return
     else:
         print(result)
         
@@ -173,12 +182,15 @@ def _handle_command_impl():
             return
 
         print(f"Heard: {text}")
-        
+
         if _pending_clarification and (time.time() - _pending_clarification["timestamp"] < 30.0):
             t0_exec = time.time()
             resolver = RESOLVE_CLARIFICATION.get(_pending_clarification["action"])
             if resolver:
-                result = resolver(_pending_clarification["contact"], text)
+                if _pending_clarification["action"] == "email_address_retry":
+                    result = resolver(text, _pending_clarification.get("pending"))
+                else:
+                    result = resolver(_pending_clarification.get("contact"), text)
             else:
                 intent = {"action": _pending_clarification["action"], "params": {"contact": _pending_clarification["contact"], "intent": text}}
                 result = execute(intent)
@@ -186,37 +198,147 @@ def _handle_command_impl():
             t_exec = time.time()
             print(f"[timing] execute (clarified): {t_exec - t0_exec:.2f}s")
             
+            print(f"[debug] clarification resolver returned: {result}")
             _handle_result(result)
             return
         elif _pending_clarification:
             _pending_clarification = None
 
-        if _pending_confirmation and (time.time() - _pending_confirmation["timestamp"] < 10.0):
-            t_lower = text.lower()
-            if any(w in t_lower for w in ["yes", "yeah", "yep", "correct"]):
-                intent = {
-                    "action": _pending_confirmation["original_action"],
-                    "params": _pending_confirmation["original_params"]
-                }
-                _pending_confirmation = None
+        timeout = 15.0
+        if _pending_confirmation:
+            if _pending_confirmation.get("kind") == "send_email":
+                timeout = 25.0
+            elif _pending_confirmation.get("kind") == "mail_walkthrough":
+                timeout = 45.0
                 
+        print(f"[debug] _pending_confirmation CHECKED in _handle_command_impl: is_set={bool(_pending_confirmation)}")
+        if _pending_confirmation and (time.time() - _pending_confirmation["timestamp"] < timeout):
+            print(f"[debug] _pending_confirmation ACTIVE and unexpired (kind: {_pending_confirmation.get('kind')})")
+            t_lower = text.lower()
+            kind = _pending_confirmation.get("kind")
+            is_short = len(t_lower.split()) <= 5
+            
+            if kind == "mail_walkthrough":
+                index = _pending_confirmation["index"]
+                
+                norm_text = text.lower().strip().rstrip(".!?")
+                words = norm_text.split()
+                
+                is_cancel = norm_text in ["cancel", "stop", "exit", "quit", "done", "that's it", "nothing", "nevermind", "never mind"]
+                is_skip = len(words) <= 4 and norm_text in ["next", "skip", "no", "no thanks", "nope"]
+                
+                if is_cancel or is_skip:
+                    _pending_confirmation = None
+                    print(f"[debug] _pending_confirmation CLEARED in mail_walkthrough {'cancel' if is_cancel else 'skip'}")
+                    import executor
+                    next_index = index + 1
+                    if next_index < len(executor._last_unread_emails):
+                        res = executor.MAIL_WALKTHROUGH["announce"](next_index)
+                        _handle_result(res)
+                    else:
+                        msg = "That's all your unread emails."
+                        print(msg)
+                        t0_speak = time.time()
+                        speak(msg)
+                        print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
+                    return
+                else:
+                    t0_exec = time.time()
+                    import re
+                    instruction = re.sub(r'^(reply|saying|yes)\b[\s,.]*', '', text, flags=re.IGNORECASE).strip()
+                    
+                    import executor
+                    res = executor.MAIL_WALKTHROUGH["reply"](index, instruction)
+                    _pending_confirmation = None
+                    print("[debug] _pending_confirmation CLEARED in mail_walkthrough reply")
+                    t_exec = time.time()
+                    print(f"[timing] execute (reply): {t_exec - t0_exec:.2f}s")
+                    _handle_result(res)
+                    return
+
+            elif is_short and any(w in t_lower for w in ["yes", "yeah", "yep", "correct"]):
                 t0_exec = time.time()
-                result = execute(intent)
+                walkthrough_idx = _pending_confirmation.get("walkthrough_index") if kind == "send_email" else None
+                
+                if kind == "app_suggestion":
+                    intent = {
+                        "action": _pending_confirmation["original_action"],
+                        "params": _pending_confirmation["original_params"]
+                    }
+                    _pending_confirmation = None
+                    print("[debug] _pending_confirmation CLEARED in app_suggestion confirm")
+                    result = execute(intent)
+                elif kind == "send_email":
+                    from executor import _send_email_confirmed
+                    result = _send_email_confirmed(
+                        _pending_confirmation["to"], _pending_confirmation["subject"], _pending_confirmation["body"]
+                    )
+                    _pending_confirmation = None
+                    print("[debug] _pending_confirmation CLEARED in send_email confirm")
                 t_exec = time.time()
                 print(f"[timing] execute (confirmed): {t_exec - t0_exec:.2f}s")
                 
                 _handle_result(result)
+                
+                if walkthrough_idx is not None:
+                    import executor
+                    next_idx = walkthrough_idx + 1
+                    if next_idx < len(executor._last_unread_emails):
+                        res = executor.MAIL_WALKTHROUGH["announce"](next_idx)
+                        _handle_result(res)
+                    else:
+                        msg = "That's all your unread emails."
+                        print(msg)
+                        t0_speak = time.time()
+                        speak(msg)
+                        print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
                 return
-            elif any(w in t_lower for w in ["no", "nope", "cancel"]):
-                _pending_confirmation = None
-                print("Okay, cancelled.")
+            elif is_short and any(w in t_lower for w in ["no", "nope", "cancel", "never mind"]):
+                walkthrough_idx = _pending_confirmation.get("walkthrough_index") if kind == "send_email" else None
+                if kind == "send_email":
+                    msg = "Okay, I won't send it."
+                else:
+                    speak("Okay, I won't do that.")
+                    _pending_confirmation = None
+                    print("[debug] _pending_confirmation CLEARED in generic confirmation 'no'")
+                print(msg)
                 
                 t0_speak = time.time()
-                speak("Okay, cancelled.")
+                speak(msg)
                 print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
+                
+                if walkthrough_idx is not None:
+                    import executor
+                    next_idx = walkthrough_idx + 1
+                    if next_idx < len(executor._last_unread_emails):
+                        res = executor.MAIL_WALKTHROUGH["announce"](next_idx)
+                        _handle_result(res)
+                    else:
+                        msg = "That's all your unread emails."
+                        print(msg)
+                        t0_speak = time.time()
+                        speak(msg)
+                        print(f"[timing] speak: {time.time() - t0_speak:.2f}s")
+                return
+            elif kind == "send_email":
+                t0_exec = time.time()
+                from executor import revise_email
+                result = revise_email(
+                    _pending_confirmation["to"],
+                    _pending_confirmation["subject"],
+                    _pending_confirmation["body"],
+                    text,
+                    walkthrough_index=_pending_confirmation.get("walkthrough_index")
+                )
+                _pending_confirmation = None
+                print("[debug] _pending_confirmation CLEARED before sending revised email result")
+                t_exec = time.time()
+                print(f"[timing] execute (edit): {t_exec - t0_exec:.2f}s")
+                _handle_result(result)
                 return
             else:
                 _pending_confirmation = None
+                print("[debug] _pending_confirmation CLEARED due to unknown kind")
 
         try:
             t0_brain = time.time()
@@ -245,6 +367,24 @@ def _handle_command_impl():
 
 def handle_command():
     global _last_print_time
+    
+    print(f"[debug] handle_command called, lock_held={_busy_lock.locked()}, is_speaking={tts.is_speaking()}")
+
+    if _busy_lock.locked():
+        if tts.is_speaking():
+            print("[debug] branch: INTERRUPT")
+            print("[debug] calling tts.stop_speaking()...")
+            tts.stop_speaking()
+            print("[debug] tts.stop_speaking() returned. Polling for lock...")
+            
+            # poll in a short loop (up to 0.5s, checking every 0.05s) for _busy_lock to become available
+            t0 = time.time()
+            while _busy_lock.locked() and (time.time() - t0) < 0.5:
+                time.sleep(0.05)
+            print(f"[debug] polling finished. lock freed={not _busy_lock.locked()}")
+        else:
+            print("[debug] branch: STILL_PROCESSING (locked, but not speaking)")
+            
     if not _busy_lock.acquire(blocking=False):
         if _is_recording:
             # Silently ignore OS auto-repeat events while the user is intentionally holding the key
@@ -254,6 +394,8 @@ def handle_command():
             print("Still processing the previous command, ignoring this press.")
             _last_print_time = time.time()
         return
+        
+    print("[debug] branch: NORMAL_START")
         
     def _run_and_release():
         pythoncom.CoInitialize()
